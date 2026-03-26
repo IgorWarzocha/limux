@@ -568,6 +568,7 @@ pub struct TerminalCallbacks {
     pub on_bell: Box<VoidCallback>,
     pub on_close: Box<VoidCallback>,
     pub on_user_activity: Box<VoidCallback>,
+    pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
@@ -1124,6 +1125,7 @@ fn show_terminal_context_menu(
         ("Copy", has_selection),
         ("Paste", true),
         ("---", false),
+        ("Browser", true),
         ("Split Right", true),
         ("Split Down", true),
         ("Keybinds", true),
@@ -1172,6 +1174,10 @@ fn show_terminal_context_menu(
                     "Paste" => {
                         (cb.borrow().on_user_activity)();
                         surface_action(surface, "paste_from_clipboard");
+                    }
+                    "Browser" => {
+                        let callbacks = cb.borrow();
+                        (callbacks.on_open_browser_here)();
                     }
                     "Split Right" => {
                         let callbacks = cb.borrow();
