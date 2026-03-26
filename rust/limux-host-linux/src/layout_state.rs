@@ -106,6 +106,8 @@ pub enum TabContentState {
     Terminal {
         #[serde(default)]
         cwd: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
     },
     Browser {
         #[serde(default)]
@@ -171,6 +173,7 @@ impl TabState {
             pinned: false,
             content: TabContentState::Terminal {
                 cwd: cwd.map(|value| value.to_string()),
+                command: None,
             },
         }
     }
@@ -469,8 +472,9 @@ mod tests {
         };
         assert_eq!(pane.tabs.len(), 1);
         match &pane.tabs[0].content {
-            TabContentState::Terminal { cwd } => {
+            TabContentState::Terminal { cwd, command } => {
                 assert_eq!(cwd.as_deref(), Some("/tmp/project"));
+                assert!(command.is_none());
             }
             other => panic!("expected terminal tab, got {other:?}"),
         }
@@ -568,10 +572,49 @@ mod tests {
         };
         assert_eq!(pane.tabs.len(), 1);
         match &pane.tabs[0].content {
-            TabContentState::Terminal { cwd } => {
+            TabContentState::Terminal { cwd, command } => {
                 assert_eq!(cwd.as_deref(), Some("/tmp/project"));
+                assert!(command.is_none());
             }
             other => panic!("expected terminal fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_command_round_trips_through_session_json() {
+        let state = AppSessionState {
+            workspaces: vec![WorkspaceState {
+                name: "workspace".to_string(),
+                favorite: false,
+                cwd: Some("/tmp/project".to_string()),
+                folder_path: None,
+                layout: LayoutNodeState::Pane(PaneState {
+                    active_tab_id: Some("term-1".to_string()),
+                    tabs: vec![TabState {
+                        id: "term-1".to_string(),
+                        custom_name: None,
+                        pinned: false,
+                        content: TabContentState::Terminal {
+                            cwd: Some("/tmp/project".to_string()),
+                            command: Some("pnpm dev".to_string()),
+                        },
+                    }],
+                }),
+            }],
+            ..AppSessionState::default()
+        };
+
+        let raw = serde_json::to_string(&state).expect("serialize session");
+        let decoded: AppSessionState = serde_json::from_str(&raw).expect("deserialize session");
+        let LayoutNodeState::Pane(pane) = &decoded.workspaces[0].layout else {
+            panic!("expected pane");
+        };
+        match &pane.tabs[0].content {
+            TabContentState::Terminal { cwd, command } => {
+                assert_eq!(cwd.as_deref(), Some("/tmp/project"));
+                assert_eq!(command.as_deref(), Some("pnpm dev"));
+            }
+            other => panic!("expected terminal tab, got {other:?}"),
         }
     }
 

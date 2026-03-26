@@ -69,6 +69,16 @@ impl TerminalHandle {
         *self.callbacks.borrow_mut() = callbacks;
     }
 
+    pub fn send_text(&self, text: &str) -> bool {
+        let surface = *self.surface_cell.borrow();
+        let Some(surface) = surface else {
+            return false;
+        };
+
+        unsafe { ghostty_surface_text(surface, text.as_ptr().cast(), text.len()) };
+        true
+    }
+
     pub fn perform_binding_action(&self, action: &str) -> bool {
         let surface = *self.surface_cell.borrow();
         surface_action(surface, action);

@@ -171,6 +171,7 @@ pub struct PaneCallbacks {
 #[derive(Clone)]
 struct TerminalTabState {
     cwd: Rc<RefCell<Option<String>>>,
+    command: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
 }
 
@@ -689,6 +690,7 @@ struct TerminalTabOptions<'a> {
     custom_name: Option<&'a str>,
     pinned: bool,
     cwd: Option<&'a str>,
+    command: Option<&'a str>,
 }
 
 struct BrowserTabOptions<'a> {
@@ -722,7 +724,7 @@ fn restore_tabs_from_state(
 
     for saved_tab in &saved_state.tabs {
         match &saved_tab.content {
-            TabContentState::Terminal { cwd } => add_terminal_tab_inner(
+            TabContentState::Terminal { cwd, command } => add_terminal_tab_inner(
                 internals,
                 cwd.as_deref().or(working_directory),
                 Some(TerminalTabOptions {
@@ -730,6 +732,7 @@ fn restore_tabs_from_state(
                     custom_name: saved_tab.custom_name.as_deref(),
                     pinned: saved_tab.pinned,
                     cwd: cwd.as_deref().or(working_directory),
+                    command: command.as_deref(),
                 }),
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
@@ -900,6 +903,10 @@ fn add_terminal_tab_inner(
             .and_then(|value| value.cwd.map(|cwd| cwd.to_string()))
             .or_else(|| working_directory.map(|cwd| cwd.to_string())),
     ));
+    let term_command =
+        Rc::new(RefCell::new(options.as_ref().and_then(|value| {
+            value.command.map(|command| command.to_string())
+        })));
     let term_callbacks = make_terminal_callbacks(internals, &tab_id, &title_label, &term_cwd);
 
     let term = terminal::create_terminal(working_directory, term_callbacks);
@@ -920,6 +927,7 @@ fn add_terminal_tab_inner(
             kind: TabKind::Terminal {
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
+                    command: term_command.clone(),
                     handle: term.handle.clone(),
                 },
             },
@@ -1219,6 +1227,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
             let content = match &entry.kind {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
+                    command: state.command.borrow().clone(),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),
@@ -1263,6 +1272,35 @@ pub fn tab_working_directory(pane_widget: &gtk::Widget, tab_id: &str) -> Option<
         TabKind::Terminal { state } => state.cwd.borrow().clone(),
         TabKind::Browser { .. } | TabKind::Keybinds => None,
     }
+}
+
+pub fn run_startup_commands(pane_widget: &gtk::Widget) -> usize {
+    let Some(internals) = find_pane_internals(pane_widget) else {
+        return 0;
+    };
+
+    let commands: Vec<(terminal::TerminalHandle, String)> = {
+        let tab_state = internals.tab_state.borrow();
+        tab_state
+            .tabs
+            .iter()
+            .filter_map(|entry| match &entry.kind {
+                TabKind::Terminal { state } => state
+                    .command
+                    .borrow()
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|command| !command.is_empty())
+                    .map(|command| (state.handle.clone(), format!("{command}\n"))),
+                TabKind::Browser { .. } | TabKind::Keybinds => None,
+            })
+            .collect()
+    };
+
+    commands
+        .into_iter()
+        .filter(|(handle, command)| handle.send_text(command))
+        .count()
 }
 
 pub fn move_tab_to_pane(
@@ -1516,6 +1554,28 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         });
     }
 
+    let is_terminal = context
+        .tab_state
+        .borrow()
+        .tabs
+        .iter()
+        .any(|entry| entry.id == tab_id && matches!(entry.kind, TabKind::Terminal { .. }));
+
+    let startup_btn = gtk::Button::with_label("Command");
+    startup_btn.add_css_class("flat");
+    startup_btn.set_visible(is_terminal);
+    if is_terminal {
+        let state = context.tab_state.clone();
+        let tid = tab_id.to_string();
+        let menu_ref = menu.clone();
+        let callbacks = context.callbacks.clone();
+        let tab_btn = tab_btn.clone();
+        startup_btn.connect_clicked(move |_| {
+            menu_ref.popdown();
+            show_startup_command_popover(&tab_btn, &state, &tid, &callbacks);
+        });
+    }
+
     // Pin / Unpin
     let is_pinned = context
         .tab_state
@@ -1576,6 +1636,9 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     }
 
     menu_box.append(&rename_btn);
+    if is_terminal {
+        menu_box.append(&startup_btn);
+    }
     menu_box.append(&pin_btn);
     menu_box.append(&close_btn);
     menu.set_child(Some(&menu_box));
@@ -1668,6 +1731,100 @@ fn show_rename_dialog(
         });
         entry.add_controller(focus_controller);
     }
+}
+
+fn show_startup_command_popover(
+    tab_btn: &gtk::Box,
+    tab_state: &Rc<RefCell<TabState>>,
+    tab_id: &str,
+    callbacks: &Rc<PaneCallbacks>,
+) {
+    let current_command = {
+        let state = tab_state.borrow();
+        state
+            .tabs
+            .iter()
+            .find(|entry| entry.id == tab_id)
+            .and_then(|entry| match &entry.kind {
+                TabKind::Terminal { state } => state.command.borrow().clone(),
+                TabKind::Browser { .. } | TabKind::Keybinds => None,
+            })
+            .unwrap_or_default()
+    };
+
+    let popover = gtk::Popover::new();
+    popover.set_parent(tab_btn);
+    popover.set_has_arrow(true);
+
+    let box_ = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    box_.set_margin_top(8);
+    box_.set_margin_bottom(8);
+    box_.set_margin_start(8);
+    box_.set_margin_end(8);
+
+    let entry = gtk::Entry::builder()
+        .text(&current_command)
+        .placeholder_text("pnpm dev")
+        .width_chars(28)
+        .build();
+
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let save_btn = gtk::Button::with_label("Save");
+    let clear_btn = gtk::Button::with_label("Clear");
+    clear_btn.add_css_class("flat");
+    buttons.append(&save_btn);
+    buttons.append(&clear_btn);
+    box_.append(&entry);
+    box_.append(&buttons);
+    popover.set_child(Some(&box_));
+
+    let commit = Rc::new(Cell::new(false));
+    let save_command = {
+        let commit = commit.clone();
+        let tab_state = tab_state.clone();
+        let tab_id = tab_id.to_string();
+        let callbacks = callbacks.clone();
+        let popover = popover.clone();
+        move |entry: &gtk::Entry, clear: bool| {
+            if commit.replace(true) {
+                return;
+            }
+            let value = if clear {
+                None
+            } else {
+                let text = entry.text().trim().to_string();
+                (!text.is_empty()).then_some(text)
+            };
+            let mut state = tab_state.borrow_mut();
+            if let Some(entry) = state.find_tab_mut(&tab_id) {
+                if let TabKind::Terminal { state } = &mut entry.kind {
+                    *state.command.borrow_mut() = value;
+                }
+            }
+            drop(state);
+            (callbacks.on_state_changed)();
+            popover.popdown();
+        }
+    };
+
+    {
+        let save_command = save_command.clone();
+        entry.connect_activate(move |entry| save_command(entry, false));
+    }
+    {
+        let entry = entry.clone();
+        let save_command = save_command.clone();
+        save_btn.connect_clicked(move |_| save_command(&entry, false));
+    }
+    {
+        let entry = entry.clone();
+        clear_btn.connect_clicked(move |_| save_command(&entry, true));
+    }
+
+    popover.connect_closed(move |popover| popover.unparent());
+    popover.popup();
+    entry.grab_focus();
+    entry.select_region(0, -1);
 }
 
 fn normalize_reorder_insert_index(source_idx: usize, insert_idx: usize) -> Option<usize> {

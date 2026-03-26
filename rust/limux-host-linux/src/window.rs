@@ -1570,12 +1570,15 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     menu_box.set_margin_start(4);
     menu_box.set_margin_end(4);
 
+    let launch_btn = gtk::Button::with_label("Launch");
+    launch_btn.add_css_class("flat");
     let rename_btn = gtk::Button::with_label("Rename");
     rename_btn.add_css_class("flat");
     let delete_btn = gtk::Button::with_label("Delete");
     delete_btn.add_css_class("flat");
     delete_btn.add_css_class("destructive-action");
 
+    menu_box.append(&launch_btn);
     menu_box.append(&rename_btn);
     menu_box.append(&delete_btn);
 
@@ -1597,6 +1600,15 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
         let state = state.clone();
         let ws_id = workspace_id.to_string();
         let pop = popover.clone();
+        launch_btn.connect_clicked(move |_| {
+            pop.popdown();
+            launch_workspace_by_id(&state, &ws_id);
+        });
+    }
+    {
+        let state = state.clone();
+        let ws_id = workspace_id.to_string();
+        let pop = popover.clone();
         delete_btn.connect_clicked(move |_| {
             pop.popdown();
             close_workspace_by_id(&state, &ws_id);
@@ -1610,6 +1622,54 @@ fn show_workspace_context_menu(state: &State, workspace_id: &str, row: &gtk::Lis
     }
 
     popover.popup();
+}
+
+fn run_workspace_commands_in_layout(widget: &gtk::Widget) -> usize {
+    if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+        return paned
+            .start_child()
+            .map(|child| run_workspace_commands_in_layout(&child))
+            .unwrap_or(0)
+            + paned
+                .end_child()
+                .map(|child| run_workspace_commands_in_layout(&child))
+                .unwrap_or(0);
+    }
+
+    pane::run_startup_commands(widget)
+}
+
+fn launch_workspace_by_id(state: &State, workspace_id: &str) {
+    let workspace_target = {
+        let s = state.borrow();
+        s.workspaces
+            .iter()
+            .enumerate()
+            .find(|(_, workspace)| workspace.id == workspace_id)
+            .map(|(idx, workspace)| (idx, workspace.sidebar_row.clone(), s.sidebar_list.clone()))
+    };
+
+    let Some((idx, row, sidebar_list)) = workspace_target else {
+        return;
+    };
+
+    switch_workspace(state, idx);
+    sidebar_list.select_row(Some(&row));
+
+    let state = state.clone();
+    let workspace_id = workspace_id.to_string();
+    glib::idle_add_local_once(move || {
+        let root = {
+            let s = state.borrow();
+            s.workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .map(|workspace| workspace.root.clone())
+        };
+        if let Some(root) = root {
+            let _ = run_workspace_commands_in_layout(&root);
+        }
+    });
 }
 
 fn clamp_workspace_insert_index_for_pinning(
