@@ -173,6 +173,8 @@ pub struct PaneCallbacks {
 struct TerminalTabState {
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
+    auto_created_placeholder: bool,
+    has_user_interaction: Rc<Cell<bool>>,
 }
 
 #[derive(Clone)]
@@ -484,7 +486,17 @@ pub fn create_pane(
     if let Some(saved_state) = initial_state {
         restore_tabs_from_state(&internals, working_directory, saved_state);
     } else if !skip_default_tab {
-        add_terminal_tab_inner(&internals, working_directory, None);
+        add_terminal_tab_inner(
+            &internals,
+            working_directory,
+            Some(TerminalTabOptions {
+                id: None,
+                custom_name: None,
+                pinned: false,
+                cwd: working_directory,
+                auto_created_placeholder: true,
+            }),
+        );
     }
 
     {
@@ -690,6 +702,7 @@ struct TerminalTabOptions<'a> {
     custom_name: Option<&'a str>,
     pinned: bool,
     cwd: Option<&'a str>,
+    auto_created_placeholder: bool,
 }
 
 struct BrowserTabOptions<'a> {
@@ -731,6 +744,7 @@ fn restore_tabs_from_state(
                     custom_name: saved_tab.custom_name.as_deref(),
                     pinned: saved_tab.pinned,
                     cwd: cwd.as_deref().or(working_directory),
+                    auto_created_placeholder: false,
                 }),
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
@@ -793,6 +807,7 @@ fn make_terminal_callbacks(
     tab_id: &str,
     title_label: &gtk::Label,
     term_cwd: &Rc<RefCell<Option<String>>>,
+    has_user_interaction: &Rc<Cell<bool>>,
 ) -> TerminalCallbacks {
     let tid_for_title = tab_id.to_string();
     let title_label = title_label.clone();
@@ -808,6 +823,7 @@ fn make_terminal_callbacks(
     let tab_state = internals.tab_state.clone();
     let pane_outer = internals.pane_outer.clone();
     let term_cwd_for_pwd = term_cwd.clone();
+    let has_user_interaction = has_user_interaction.clone();
     let tid_for_close = tab_id.to_string();
 
     TerminalCallbacks {
@@ -860,6 +876,7 @@ fn make_terminal_callbacks(
                 );
             });
         }),
+        on_user_activity: Box::new(move || has_user_interaction.set(true)),
         on_split_right: Box::new({
             let pane_outer = internals.pane_outer.clone();
             move || {
@@ -901,7 +918,14 @@ fn add_terminal_tab_inner(
             .and_then(|value| value.cwd.map(|cwd| cwd.to_string()))
             .or_else(|| working_directory.map(|cwd| cwd.to_string())),
     ));
-    let term_callbacks = make_terminal_callbacks(internals, &tab_id, &title_label, &term_cwd);
+    let has_user_interaction = Rc::new(Cell::new(false));
+    let term_callbacks = make_terminal_callbacks(
+        internals,
+        &tab_id,
+        &title_label,
+        &term_cwd,
+        &has_user_interaction,
+    );
 
     let term = terminal::create_terminal(
         working_directory,
@@ -928,6 +952,11 @@ fn add_terminal_tab_inner(
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
+                    auto_created_placeholder: options
+                        .as_ref()
+                        .map(|value| value.auto_created_placeholder)
+                        .unwrap_or(false),
+                    has_user_interaction,
                 },
             },
         });
@@ -971,6 +1000,13 @@ fn add_terminal_tab_inner(
 }
 
 fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserTabOptions<'_>>) {
+    if replace_untouched_placeholder_terminal_with_browser(internals, options.as_ref()) {
+        if options.is_none() {
+            (internals.callbacks.on_state_changed)();
+        }
+        return;
+    }
+
     let tab_id = options
         .as_ref()
         .and_then(|value| value.id.map(|id| id.to_string()))
@@ -1044,6 +1080,78 @@ fn add_browser_tab_inner(internals: &Rc<PaneInternals>, options: Option<BrowserT
     if options.is_none() {
         (internals.callbacks.on_state_changed)();
     }
+}
+
+fn replace_untouched_placeholder_terminal_with_browser(
+    internals: &Rc<PaneInternals>,
+    options: Option<&BrowserTabOptions<'_>>,
+) -> bool {
+    let tab_id = {
+        let ts = internals.tab_state.borrow();
+        let Some(entry) = ts.tabs.first() else {
+            return false;
+        };
+
+        match &entry.kind {
+            TabKind::Terminal { state }
+                if ts.tabs.len() == 1
+                    && state.auto_created_placeholder
+                    && !state.has_user_interaction.get()
+                    && entry.custom_name.is_none()
+                    && !entry.pinned => {}
+            TabKind::Terminal { .. } | TabKind::Browser { .. } | TabKind::Keybinds => {
+                return false;
+            }
+        }
+
+        entry.id.clone()
+    };
+
+    let saved_uri = Rc::new(RefCell::new(
+        options
+            .as_ref()
+            .and_then(|value| value.uri.map(|uri| uri.to_string())),
+    ));
+    let (widget, title, handles) = create_browser_widget(
+        options.as_ref().and_then(|value| value.uri),
+        saved_uri.clone(),
+        internals.callbacks.clone(),
+    );
+
+    let old_content = {
+        let mut ts = internals.tab_state.borrow_mut();
+        let Some(entry) = ts.find_tab_mut(&tab_id) else {
+            return false;
+        };
+
+        let old_content = entry.content.clone();
+        entry.content = widget.clone();
+        entry.custom_name = options
+            .as_ref()
+            .and_then(|value| value.custom_name.map(|name| name.to_string()));
+        entry.pinned = options.as_ref().map(|value| value.pinned).unwrap_or(false);
+        entry.kind = TabKind::Browser {
+            state: BrowserTabState {
+                uri: saved_uri,
+                handles,
+            },
+        };
+        entry
+            .title_label
+            .set_label(entry.custom_name.as_deref().unwrap_or(title.as_str()));
+        apply_pin_visuals(&entry.tab_button, entry.pinned);
+        old_content
+    };
+
+    internals.content_stack.remove(&old_content);
+    internals.content_stack.add_named(&widget, Some(&tab_id));
+    activate_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        &tab_id,
+    );
+    true
 }
 
 fn add_keybind_editor_tab_inner(internals: &Rc<PaneInternals>, input: KeybindsTabInput<'_>) {
@@ -1855,6 +1963,7 @@ fn rebind_moved_tab_entry(entry: &mut TabEntry, target: &Rc<PaneInternals>) {
             &entry.id,
             &entry.title_label,
             &state.cwd,
+            &state.has_user_interaction,
         ));
     }
     entry.tab_button = build_tab_button_from_label(&entry.title_label, &entry.id, target);

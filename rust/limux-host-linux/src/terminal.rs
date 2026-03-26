@@ -567,6 +567,7 @@ pub struct TerminalCallbacks {
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
     pub on_bell: Box<VoidCallback>,
     pub on_close: Box<VoidCallback>,
+    pub on_user_activity: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
     pub on_split_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
@@ -826,8 +827,13 @@ pub fn create_terminal(
     {
         let sc_press = surface_cell.clone();
         let sc_release = surface_cell.clone();
+        let callbacks_for_press = callbacks.clone();
         let key_controller = gtk::EventControllerKey::new();
         key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
+            if key_counts_as_user_activity(keyval) {
+                (callbacks_for_press.borrow().on_user_activity)();
+            }
+
             if let Some(surface) = *sc_press.borrow() {
                 let c_text = key_event_text(keyval);
 
@@ -1016,6 +1022,7 @@ pub fn create_terminal(
     // shell-escaped paths into the terminal.
     {
         let surface_cell = surface_cell.clone();
+        let callbacks = callbacks.clone();
         let drop_target = gtk::DropTarget::new(
             gtk::gdk::FileList::static_type(),
             gtk::gdk::DragAction::COPY,
@@ -1030,6 +1037,8 @@ pub fn create_terminal(
             let Some(text) = dropped_file_text(&file_list) else {
                 return false;
             };
+
+            (callbacks.borrow().on_user_activity)();
 
             unsafe {
                 ghostty_surface_text(surface, text.as_ptr(), text.as_bytes().len());
@@ -1160,7 +1169,10 @@ fn show_terminal_context_menu(
                 pop.popdown();
                 match label.as_str() {
                     "Copy" => surface_action(surface, "copy_to_clipboard"),
-                    "Paste" => surface_action(surface, "paste_from_clipboard"),
+                    "Paste" => {
+                        (cb.borrow().on_user_activity)();
+                        surface_action(surface, "paste_from_clipboard");
+                    }
                     "Split Right" => {
                         let callbacks = cb.borrow();
                         (callbacks.on_split_right)();
@@ -1249,6 +1261,23 @@ fn key_event_text(keyval: gtk::gdk::Key) -> Option<CString> {
     let mut buf = [0u8; 4];
     let s = ch.encode_utf8(&mut buf);
     CString::new(s.as_bytes()).ok()
+}
+
+fn key_counts_as_user_activity(keyval: gtk::gdk::Key) -> bool {
+    !matches!(
+        keyval,
+        gtk::gdk::Key::Shift_L
+            | gtk::gdk::Key::Shift_R
+            | gtk::gdk::Key::Control_L
+            | gtk::gdk::Key::Control_R
+            | gtk::gdk::Key::Alt_L
+            | gtk::gdk::Key::Alt_R
+            | gtk::gdk::Key::Meta_L
+            | gtk::gdk::Key::Meta_R
+            | gtk::gdk::Key::Super_L
+            | gtk::gdk::Key::Super_R
+            | gtk::gdk::Key::ISO_Level3_Shift
+    )
 }
 
 fn keyval_unicode_unshifted(
